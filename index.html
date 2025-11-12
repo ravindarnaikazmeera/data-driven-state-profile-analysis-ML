@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>📊 CMIE : Latest 10-Year Data Visualizer + Forecasts</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="stylesdc.css" />
+</head>
+<body>
+  <h2>CMIE : States of India : Latest 10 Years Data Visualizer 📈</h2>
+
+  <!-- Controls (no upload now) -->
+  <div class="controls">
+    <label for="stateSel">State / UT:</label>
+    <select id="stateSel">
+      <option value="">-- Select State / UT --</option>
+    </select>
+
+    <label for="attr">Attribute:</label>
+    <select id="attr"></select>
+
+    <label for="ratio">Aspect:</label>
+    <select id="ratio">
+      <option value="16:9" selected>16:9</option>
+      <option value="4:3">4:3</option>
+      <option value="3:2">3:2</option>
+      <option value="1:1">1:1</option>
+      <option value="21:9">21:9</option>
+    </select>
+
+    <button id="download">⬇️ Download PNG</button>
+  </div>
+
+  <!-- Main: chart + sidebar -->
+  <div id="mainWrap">
+    <div id="chartWrap">
+      <canvas id="chartCanvas"></canvas>
+    </div>
+
+    <aside id="sidePanel" aria-label="Server analysis sidebar">
+      <div class="card sideHeader">
+        <div class="sideTitle">
+          <h3>Server Analysis</h3>
+          <span id="analysisSource" class="pill pill-badge info">Server</span>
+        </div>
+        <p class="sideHint">Insights, forecasts, and correlations computed by the backend.</p>
+      </div>
+
+      <div class="card">
+        <h3 id="metricTitle">Metric</h3>
+        <div class="kv chips">
+          <div><b>LatestYear:</b> <span id="kv_latestYear">-</span></div>
+          <div><b>LatestValue:</b> <span id="kv_latestValue">-</span></div>
+          <div><b>Forecast_t1:</b> <span id="kv_fc1">-</span></div>
+          <div><b>Forecast_t2:</b> <span id="kv_fc2">-</span></div>
+        </div>
+        <div class="takeawayRow">
+          <b>Takeaway:</b> <span id="kv_takeaway" class="pill ok">-</span>
+        </div>
+      </div>
+
+      <div class="card actions">
+        <h3>Suggested Actions</h3>
+        <ul id="actionsList"></ul>
+      </div>
+
+      <div class="card">
+        <h3 id="declinesTitle">State: Poor Stats</h3>
+        <div id="declinesList">Select a State / UT to view.</div>
+      </div>
+
+      <div class="card drawer">
+        <details>
+          <summary>Correlations (Pearson/Spearman)</summary>
+          <div class="corrWrap">
+            <table id="corrTable">
+              <thead>
+                <tr>
+                  <th>Pair</th>
+                  <th>Pearson r</th>
+                  <th>Spearman ρ</th>
+                  <th>Years</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+    </aside>
+  </div>
+
+  <!-- libs -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+  <!-- app -->
+  <script>
+    // --- globals
+    let apiResult=null, liveChart=null;
+
+    const API_URL = "http://localhost:8000";
+    const stateSel = document.getElementById('stateSel');
+    const attr = document.getElementById('attr');
+    const ratio = document.getElementById('ratio');
+
+    // --- utils
+    const humanTick = (x)=>{ const a=Math.abs(x); if(a>=1e9) return (x/1e9).toFixed(1)+'B'; if(a>=1e6) return (x/1e6).toFixed(1)+'M'; if(a>=1e3) return (x/1e3).toFixed(1)+'K'; return Number.isInteger(x)?String(x):x.toFixed(2); };
+    const labelFmt = (n)=>{ const v=Number(n); if(!Number.isFinite(v)) return '-'; if(v%1) return Math.abs(v)>=1000 ? v.toLocaleString(undefined,{maximumFractionDigits:1}) : v.toFixed(2); return v.toLocaleString(); };
+    const aspectValue = (s)=>{ const [w,h]=s.split(':').map(Number); return w/h; };
+
+    // boot: load states
+    (async function bootStates(){
+      try{
+        const r = await fetch(`${API_URL}/states`);
+        const j = await r.json();
+        stateSel.innerHTML = '<option value="">-- Select State / UT --</option>';
+        (j.states || []).forEach(s=>{
+          const opt=document.createElement('option');
+          opt.value=s.key;
+          opt.textContent = s.available ? s.label : `${s.label} (coming soon)`;
+          if(!s.available) opt.disabled = true;
+          stateSel.appendChild(opt);
+        });
+      }catch(e){
+        alert("Could not load states list from server.");
+      }
+    })();
+
+    // select a state
+    stateSel.addEventListener('change', async (e)=>{
+      const key = e.target.value;
+      if(!key) return;
+      try{
+        const r = await fetch(`${API_URL}/analyze_state?state=${encodeURIComponent(key)}`);
+        if(!r.ok) throw new Error('server error');
+        apiResult = await r.json();
+      }catch(err){
+        console.error(err);
+        alert("Server analysis failed for this region.");
+        return;
+      }
+
+      // populate attributes
+      const columns = apiResult.columns || Object.keys(apiResult.series || {});
+      attr.innerHTML = '';
+      columns.forEach(h=>{
+        const o=document.createElement('option'); o.value=h; o.textContent=h; attr.appendChild(o);
+      });
+
+      // render default
+      if(attr.options.length){
+        renderFromServerSeries(attr.value);
+      }
+      renderDeclinesNow();
+    });
+
+    // change attribute
+    attr.addEventListener('change', (e)=>{
+      if(apiResult && apiResult.series){
+        renderFromServerSeries(e.target.value);
+      }
+    });
+
+    // aspect ratio change
+    ratio.addEventListener('change', ()=>{
+      if(liveChart){
+        liveChart.options.aspectRatio = aspectValue(ratio.value);
+        liveChart.update('none');
+      } else if(apiResult && apiResult.series && attr.value){
+        renderFromServerSeries(attr.value);
+      }
+    });
+
+    // download chart
+    document.getElementById('download').addEventListener('click', ()=>{
+      const canvas=document.getElementById('chartCanvas'); const a=document.createElement('a');
+      a.href=canvas.toDataURL('image/png'); a.download='chart.png'; a.click();
+    });
+
+    // render helpers
+    function renderFromServerSeries(metric){
+      if(!apiResult || !apiResult.series || !apiResult.series[metric]) return;
+      const pts = apiResult.series[metric].filter(p=>p.year!=null && p.value!=null).sort((a,b)=>a.year-b.year);
+      const labels = pts.map(p=> String(p.year));
+      const values = pts.map(p=> Number(p.value));
+      const years  = pts.map(p=> p.year);
+
+      fillSidePanel(metric, years, values);
+      drawChart(labels, values, metric);
+    }
+
+    function drawChart(labels, values, labelName){
+      const ctx=document.getElementById('chartCanvas').getContext('2d');
+      const aspect=aspectValue(ratio.value);
+      if(liveChart) liveChart.destroy();
+      liveChart = new Chart(ctx, {
+        type:'bar',
+        data:{ labels, datasets:[{
+          label: labelName,
+          data: values,
+          backgroundColor:'rgba(59,130,246,0.35)',
+          borderColor:'rgba(59,130,246,0.9)',
+          borderWidth:1, borderRadius:8
+        }]},
+        options:{
+          responsive:true, maintainAspectRatio:true, aspectRatio:aspect, animation:false,
+          scales:{
+            x:{ grid:{color:'rgba(0,0,0,0.05)'}, ticks:{maxRotation:0,minRotation:0} },
+            y:{ title:{display:true,text:labelName}, grid:{color:'rgba(0,0,0,0.06)'}, ticks:{callback:(v)=>humanTick(v)} }
+          },
+          plugins:{ legend:{display:false} }
+        },
+        plugins:[{
+          id:'valueLabels',
+          afterDatasetsDraw:(chart)=>{
+            const {ctx}=chart; ctx.save();
+            const fontSize=Math.max(12, Math.round(chart.chartArea.height*0.03));
+            ctx.font=`${fontSize}px system-ui, Arial, sans-serif`; ctx.fillStyle='#64748b';
+            const meta=chart.getDatasetMeta(0);
+            meta.data.forEach((bar,i)=>{ const v=values[i]; if(v==null) return; ctx.textAlign='center'; ctx.textBaseline='bottom'; ctx.fillText(labelFmt(v), bar.x, bar.y-6); });
+            ctx.restore();
+          }
+        }]
+      });
+    }
+
+    function fillSidePanel(metric, years, values){
+      document.getElementById('metricTitle').textContent=metric;
+      const pill=document.getElementById('kv_takeaway');
+      const actList=document.getElementById('actionsList'); actList.innerHTML='';
+
+      if(apiResult && apiResult.metrics){
+        const m = apiResult.metrics.find(x=>x.metric===metric);
+        if(m && m.status!=='insufficient'){
+          kv_latestYear.textContent = m.latestYear ?? '-';
+          kv_latestValue.textContent = labelFmt(m.latestValue);
+          kv_fc1.textContent = labelFmt(m.forecast_t1);
+          kv_fc2.textContent = labelFmt(m.forecast_t2);
+
+          if(m.declineFlag){
+            pill.textContent=`Decline ${m.severity}`;
+            pill.className='pill ' + (m.severity==='High'?'alert':(m.severity==='Medium'?'warn':'ok'));
+            (m.actions||[]).slice(0,2).forEach(a=>{ const li=document.createElement('li'); li.textContent=a; actList.appendChild(li); });
+          } else {
+            pill.textContent = (m.drop_vs_baseline_pct>0 || m.drop_vs_forecast_pct>0) ? 'Improving' : 'Stable';
+            pill.className='pill ok';
+            const li=document.createElement('li'); li.textContent='No urgent actions — metric is stable/improving.'; actList.appendChild(li);
+          }
+
+          // correlations
+          const tbody=document.querySelector('#corrTable tbody'); tbody.innerHTML='';
+          (apiResult.correlations||[]).slice(0,30).forEach(p=>{
+            const tr=document.createElement('tr'); if(Math.abs(p.pearson)>=0.7) tr.classList.add('highlight');
+            tr.innerHTML=`<td>${p.x} ↔ ${p.y}</td><td>${(p.pearson??0).toFixed(3)}</td><td>${(p.spearman??0).toFixed(3)}</td><td>${p.n}</td>`;
+            tbody.appendChild(tr);
+          });
+
+          const declines = (apiResult.metrics||[]).filter(mm=>mm.declineFlag);
+          document.getElementById('declinesTitle').textContent = declines.length ? 'State: Poor Stats' : 'State: All Good';
+          return;
+        }
+      }
+
+      // If metric not found in server metrics:
+      const n=values.length; const latestYear=years[n-1]; const latestVal=values[n-1];
+      kv_latestYear.textContent = latestYear ?? '-';
+      kv_latestValue.textContent = labelFmt(latestVal);
+      kv_fc1.textContent = '-'; kv_fc2.textContent='-';
+      pill.textContent = 'Stable'; pill.className='pill ok';
+      const tbody=document.querySelector('#corrTable tbody'); tbody.innerHTML='';
+      document.getElementById('declinesTitle').textContent = 'State: All Good';
+    }
+
+    function renderDeclinesNow(){
+      const wrap=document.getElementById('declinesList'); wrap.innerHTML='';
+      const title=document.getElementById('declinesTitle');
+      let declines=[];
+      if(apiResult && apiResult.metrics){
+        const ord={High:0, Medium:1, Low:2};
+        declines = apiResult.metrics
+          .filter(m=>m.declineFlag)
+          .map(m=>({metric:m.metric, severity:m.severity, actions:m.actions||[]}))
+          .sort((a,b)=>ord[a.severity]-ord[b.severity]);
+      }
+      if(!declines.length){
+        title.textContent='State: All Good';
+        wrap.textContent='No poor stats detected right now.';
+        return;
+      }
+      title.textContent='State: Poor Stats';
+      declines.forEach(d=>{
+        const sevClass = d.severity==='High'?'sev-high':(d.severity==='Medium'?'sev-med':'sev-low');
+        const box=document.createElement('div'); box.className='declineBox';
+        box.innerHTML=`<div class="metric ${sevClass}">• ${d.metric} — ${d.severity}</div>`;
+        const ul=document.createElement('ul');
+        (d.actions||[]).slice(0,2).forEach(a=>{ const li=document.createElement('li'); li.textContent=a; ul.appendChild(li); });
+        box.appendChild(ul); wrap.appendChild(box);
+      });
+    }
+  </script>
+</body>
+</html>
